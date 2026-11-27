@@ -5,35 +5,33 @@ import pygame
 import threading
 import sys
 import os
-import glob
 import numpy as np
 from cube import Cube
-from model import RubikDistancePredictor, RubikEnsemble
-from torch import tensor, argsort, float32
+from model import RubikDistancePredictor, RubikEnsemble, load_eval_model
+from torch import tensor, argsort, float32, cuda
 from tkinter import Tk, filedialog
 from collections import defaultdict
-from tqdm import tqdm
+
 
 def pygame_loop(queue, stop_event):
-  global ENDPOINTS, ENDPOINT
+  global ENDPOINTS, ENDPOINT, model
   pygame.init()
-  clock = pygame.time.Clock()  # Create a clock object
+  clock = pygame.time.Clock()
   my_font = pygame.font.SysFont('freesans', 100)
 
   display_info = pygame.display.Info()
-  
   screen_width = display_info.current_w
   screen_height = display_info.current_h
-  
-  window_width = int(screen_width) // 3
-  window_height = int(screen_height) // 3
+
+  window_width = int(screen_width) #// 3
+  window_height = int(screen_height) #// 3
 
   screen = pygame.display.set_mode((window_width, window_height))
   pygame.display.set_caption("Neural Cube")
 
   try:
     image_path = resource_path("assets/neuralcube.png")
-    original_image = pygame.image.load(image_path) 
+    original_image = pygame.image.load(image_path)
   except pygame.error as e:
     print(f"Error loading image: {e}")
     print(f"Image path: {image_path}")
@@ -43,6 +41,7 @@ def pygame_loop(queue, stop_event):
   solving = False
   stepping = False
   maxxing = 0
+
   while running:
     for event in pygame.event.get():
       if event.type == pygame.QUIT:
@@ -102,7 +101,6 @@ def pygame_loop(queue, stop_event):
         if event.key == pygame.K_l:
           neuralcube.rotate(9)
 
-
         if event.key == pygame.K_1:
           maxxing = 1
         if event.key == pygame.K_HOME:
@@ -121,12 +119,11 @@ def pygame_loop(queue, stop_event):
           if not neuralcube.isSolved():
             stepping = True
 
-        
         if event.key == pygame.K_2:
           neuralcube.reset()
           neuralcube.history = defaultdict(int)
           neuralcube.setState(ENDPOINTS[ENDPOINT])
-        
+
         if event.key == pygame.K_3:
           ENDPOINT += 1
           if ENDPOINT >= len(ENDPOINTS):
@@ -134,18 +131,18 @@ def pygame_loop(queue, stop_event):
           neuralcube.reset()
           neuralcube.history = defaultdict(int)
           neuralcube.setState(ENDPOINTS[ENDPOINT])
-        
+
     if solving or stepping:
       stepping = False
 
       state = neuralcube.getState()
-      probe =  tensor(neuralcube.getProbe(), dtype=float32)
+      probe = tensor(neuralcube.getProbe(), dtype=float32)
       predictions = model(probe).squeeze()
       choices = argsort(predictions)
       choice = neuralcube.history[state]
 
       if choice < 18:
-        action = choices[choice]
+        action = int(choices[choice])
         neuralcube.act(action)
         neuralcube.history[state] += 1
       else:
@@ -154,21 +151,20 @@ def pygame_loop(queue, stop_event):
 
       if neuralcube.isSolved():
         solving = False
-        neuralcube.history = defaultdict(int)            
+        neuralcube.history = defaultdict(int)
 
     if maxxing > 0:
       maxxing -= 1
       state = neuralcube.getState()
-      probe =  tensor(neuralcube.getProbe(), dtype=float32)
+      probe = tensor(neuralcube.getProbe(), dtype=float32)
       predictions = model(probe).squeeze()
       choices = argsort(predictions)
-      action = choices[-1]
+      action = int(choices[-1])
       neuralcube.act(action)
-
 
     result = neuralcube.toOneHot()
     result = tensor(result, dtype=float32)
-    result = model(result).detach().squeeze() # Remove the batch dimension
+    result = model(result).detach().squeeze()
     result = str(float(result))
 
     image = pygame.Surface.copy(original_image)
@@ -176,14 +172,14 @@ def pygame_loop(queue, stop_event):
     lookup = neuralcube.toColorHot(L=248)
 
     for sticker, chroma in enumerate(range(10, 64)):
-      color_to_replace = (chroma, chroma, chroma)  
+      color_to_replace = (chroma, chroma, chroma)
       new_color = lookup[sticker]
       pixel_array.replace(color_to_replace, new_color)
     pixel_array.close()
 
     image = pygame.transform.scale(image, (window_width, window_height))
-    image_rect = image.get_rect(center = (window_width // 2, window_height // 2))
-    
+    image_rect = image.get_rect(center=(window_width // 2, window_height // 2))
+
     text_surface = my_font.render(result, True, (0, 0, 0))
 
     screen.blit(image, image_rect)
@@ -192,6 +188,7 @@ def pygame_loop(queue, stop_event):
     pygame.display.flip()
     clock.tick(30)
   pygame.quit()
+
 
 async def main():
   queue = asyncio.Queue()
@@ -202,42 +199,47 @@ async def main():
   pygame_thread.join()
   print("finished")
 
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-      # PyInstaller creates a temp folder and stores path in _MEIPASS
-      base_path = sys._MEIPASS
-    except Exception:
-      base_path = os.path.abspath(".")
 
-    return os.path.join(base_path, relative_path)
+def resource_path(relative_path):
+  """Get absolute path to resource, works for dev and for PyInstaller."""
+  try:
+    base_path = sys._MEIPASS
+  except Exception:
+    base_path = os.path.abspath(".")
+
+  return os.path.join(base_path, relative_path)
 
 
 if __name__ == "__main__":
   root = Tk()
-  root.withdraw()  # Hide root tkinter window
+  root.withdraw()
+  root.attributes("-topmost", True)
 
+  eval_device = "cuda" if cuda.is_available() else "cpu"
   model_paths = []
   all_endpoints_lists = []
 
   num_models = int(input("number of models? "))
-  for _ in range(num_models):
-    run_dir = filedialog.askdirectory(initialdir="checkpoints", title="Select Run Directory")
-    
-    if not run_dir:
+  for i in range(num_models):
+    selected_file = filedialog.askopenfilename(
+        initialdir="checkpoints",
+        title=f"Select Model File {i + 1} of {num_models} (.ckpt or .pt)",
+        filetypes=[
+            ("Model Checkpoint or Shrunk", "*.ckpt *.pt"),
+            ("Lightning Checkpoints", "*.ckpt"),
+            ("Shrunk PyTorch Models", "*.pt"),
+            ("All Files", "*.*")
+        ]
+    )
+
+    if not selected_file:
+      print(f"No file selected for model {i + 1}. Skipping.")
       continue
 
-    # 1. Find Checkpoint File (.ckpt)
-    ckpts = glob.glob(os.path.join(run_dir, "*.ckpt"))
-    if not ckpts:
-      raise FileNotFoundError(f"No .ckpt file found in {run_dir}")
-    
-    # Filter out 'last.ckpt' if specific accuracy checkpoints exist
-    best_ckpts = [c for c in ckpts if not c.endswith("last.ckpt")]
-    chosen_ckpt = sorted(best_ckpts)[-1] if best_ckpts else ckpts[0]
-    model_paths.append(chosen_ckpt)
+    model_paths.append(selected_file)
+    run_dir = os.path.dirname(selected_file)
 
-    # 2. Load Endpoints (.dat binary memmap produced by dataset.py)
+    # Load Endpoints (.dat binary memmap produced by dataset.py)
     endpoints_path = os.path.join(run_dir, "train_endpoints.dat")
     if os.path.exists(endpoints_path):
       file_size = os.path.getsize(endpoints_path)
@@ -247,8 +249,11 @@ if __name__ == "__main__":
     else:
       print(f"Warning: 'train_endpoints.dat' not found in {run_dir}")
 
+  if not model_paths:
+    raise FileNotFoundError("No model files selected.")
+
   if not all_endpoints_lists:
-    raise FileNotFoundError("No train_endpoints.dat found across selected run directories.")
+    raise FileNotFoundError("No train_endpoints.dat found across selected model directories.")
 
   # Interleave endpoints across models
   max_len = max(len(ep) for ep in all_endpoints_lists)
@@ -259,14 +264,13 @@ if __name__ == "__main__":
         interleaved_endpoints.append(ep_list[idx])
 
   ENDPOINTS = interleaved_endpoints
-
   ENDPOINT = 0
+
   neuralcube = Cube()
   neuralcube.history = defaultdict(int)
-
   neuralcube.setState(ENDPOINTS[ENDPOINT])
 
-  model = RubikEnsemble(model_paths)
+  model = RubikEnsemble(model_paths, device=eval_device)
 
   try:
     asyncio.run(main())

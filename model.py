@@ -17,6 +17,54 @@ import os
 import math
 import json
 
+def fixed_log_softmax(z, dim=-1):
+  i_max = torch.argmax(z, dim=dim, keepdim=True)
+  z_max = torch.gather(z, dim, i_max)
+  is_max = F.one_hot(i_max.squeeze(dim), num_classes=z.size(dim)).bool()
+  if dim != -1 and dim != z.ndim - 1:
+    is_max = is_max.movedim(-1, dim)
+  zero = z.new_zeros(())
+  shifted = torch.where(is_max, zero, z - z_max)
+  exp_others = torch.where(is_max, zero, torch.exp(shifted))
+  s = torch.sum(exp_others, dim=dim, keepdim=True)
+  return shifted - torch.log1p(s)
+
+def fixed_softmax(z, dim=-1):
+  return torch.exp(fixed_log_softmax(z, dim=dim))
+
+def fixed_cross_entropy(z, t, weight=None):
+  z_t = torch.gather(z, -1, t.unsqueeze(-1))
+  is_t = F.one_hot(t, num_classes=z.size(-1)).bool()
+  zero = z.new_zeros(())
+  shifted = torch.where(is_t, zero, z - z_t)
+  b = torch.amax(shifted, dim=-1, keepdim=True)
+  s = torch.sum(torch.where(is_t, zero, torch.exp(shifted - b)), dim=-1)
+  b_sq = b.squeeze(-1)
+  loss = b_sq + torch.log1p(s + torch.expm1(-b_sq))
+  if weight is not None:
+    w = weight[t].to(loss.dtype)
+    return torch.sum(loss * w) / torch.sum(w)
+  return loss.mean()
+
+def fixed_kl_div(z_s, log_p, log_q=None):
+  if log_q is None:
+    log_q = fixed_log_softmax(z_s, dim=-1)
+  q = torch.exp(log_q)
+  p = torch.exp(log_p)
+  p = p / p.sum(dim=-1, keepdim=True)
+  delta = log_q - log_p
+  d = delta - torch.sum(p * delta, dim=-1, keepdim=True)
+  b = torch.amax(d, dim=-1, keepdim=True)
+  b_shift = torch.where(b > 10.0, b, torch.zeros_like(b))
+  kl = b_shift + torch.log1p(
+      torch.sum(p * torch.expm1(d - b_shift), dim=-1, keepdim=True).clamp(min=0.0)
+  )
+  s = d - kl
+  u = torch.where(torch.abs(s) < 1.0, p * torch.expm1(s.clamp(-1.0, 1.0)), q - p)
+  g = u - q * torch.sum(u, dim=-1, keepdim=True)
+  loss = kl.squeeze(-1).detach() + torch.sum(g.detach() * (z_s - z_s.detach()), dim=-1)
+  return loss.mean()
+
 class RubikDistancePredictor(LightningModule):
 
   def __init__(
@@ -57,6 +105,10 @@ class RubikDistancePredictor(LightningModule):
     self.steps_per_epoch = int(np.ceil(train_ds_size / batch_size))
     self.total_steps = self.total_epochs * self.steps_per_epoch
 
+    # Upper-triangular pairwise dimensions for 54x54 Gram matrix (excluding diagonal)
+    self.num_stickers = self.hparams.input_dim // self.hparams.feat_dim
+    self.pair_dim = (self.num_stickers * (self.num_stickers - 1)) // 2  # 1431 for 54 stickers
+
     # Initialize Logarithmic Cosine scheduling engine for Learning Rate
     self.lr_schedule = LogarithmicSingleCycleCosineSchedule(
         start_lr=self.hparams.start_lr,
@@ -87,7 +139,7 @@ class RubikDistancePredictor(LightningModule):
     )
 
     self.network = Sequential(
-      Linear(self.hparams.input_dim, self.hparams.hidden_dim), ReLU(),
+      Linear(self.pair_dim, self.hparams.hidden_dim), ReLU(),
       Linear(self.hparams.hidden_dim, self.hparams.hidden_dim // 2), ReLU(),
       Linear(self.hparams.hidden_dim // 2, self.hparams.num_classes) 
     )
@@ -95,28 +147,49 @@ class RubikDistancePredictor(LightningModule):
     self.register_buffer('loss_weights', self.hparams.class_weights)
     self.loss_fn = CrossEntropyLoss(weight=self.loss_weights)
 
-    # Prepare 24 permutations
-    self.register_buffer('rotation_perms', torch.tensor(Cube.rotations, dtype=torch.long))
+    # Precompute strict upper-triangle indices (1431 unique pairs)
+    triu_row, triu_col = torch.triu_indices(self.num_stickers, self.num_stickers, offset=1)
+    self.register_buffer('triu_row', triu_row)
+    self.register_buffer('triu_col', triu_col)
 
-  def _apply_rotations(self, x, k_sub=None):
+    # Prepare 24 permutations and precompute induced permutations on the 1431 upper-triangle pairs
+    rotation_perms = torch.tensor(Cube.rotations, dtype=torch.long)
+    self.register_buffer('rotation_perms', rotation_perms)
+
+    pair_idx_matrix = torch.zeros((self.num_stickers, self.num_stickers), dtype=torch.long)
+    pair_arange = torch.arange(self.pair_dim, dtype=torch.long)
+    pair_idx_matrix[triu_row, triu_col] = pair_arange
+    pair_idx_matrix[triu_col, triu_row] = pair_arange
+    pair_rotation_perms = pair_idx_matrix[rotation_perms[:, triu_row], rotation_perms[:, triu_col]]
+    self.register_buffer('pair_rotation_perms', pair_rotation_perms)
+
+    # Pre-register class distance indices for validation EV calculation
+    self.register_buffer('eval_distances', torch.arange(self.hparams.num_classes, dtype=torch.float32))
+
+  def _compute_upper_gram(self, x):
+    """Computes q @ q.T and extracts the strict upper triangle (B, 1431)."""
     if x.dim() == 1:
       x = x.unsqueeze(0)
     batch_size = x.size(0)
+    q = x.view(batch_size, self.num_stickers, self.hparams.feat_dim)
+    m = torch.bmm(q, q.transpose(1, 2))
+    return m[:, self.triu_row, self.triu_col]
+
+  def _apply_rotations(self, x, k_sub=None):
+    """Computes upper-triangular Gram features once per state, then permutes pairs across rotations."""
+    x_pairs = self._compute_upper_gram(x)
     
     # Choose subset of K rotations if specified, otherwise use all 24
     if k_sub is not None and k_sub < 24:
       rand_indices = torch.randperm(24, device=x.device)[:k_sub]
-      selected_perms = self.rotation_perms[rand_indices]
+      selected_pair_perms = self.pair_rotation_perms[rand_indices]
       num_rotations = k_sub
     else:
-      selected_perms = self.rotation_perms
+      selected_pair_perms = self.pair_rotation_perms
       num_rotations = 24
 
-    x_reshaped = x.view(batch_size, 54, self.hparams.feat_dim)
-    x_expanded = x_reshaped.unsqueeze(1).expand(-1, num_rotations, -1, -1)
-    idx = selected_perms.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1, self.hparams.feat_dim)
-    x_aug = torch.gather(x_expanded, 2, idx)
-    return x_aug.reshape(-1, self.hparams.input_dim), num_rotations
+    x_aug = x_pairs[:, selected_pair_perms].reshape(-1, self.pair_dim)
+    return x_aug, num_rotations
 
   def _get_current_consistency_weight(self):
     current_epoch = self.global_step / self.steps_per_epoch
@@ -143,8 +216,9 @@ class RubikDistancePredictor(LightningModule):
     # Inference/Validation logic with full 24-rotation consensus
     with torch.no_grad():
       if not self.hparams.augment or c_weight == 0.0:
-        logits = self.network(x)
-        return torch.softmax(logits, dim=-1)
+        x_pairs = self._compute_upper_gram(x)
+        logits = self.network(x_pairs)
+        return fixed_softmax(logits, dim=-1)
 
       all_avg_probs = []
       chunk_size = 128
@@ -153,7 +227,7 @@ class RubikDistancePredictor(LightningModule):
         x_all, _ = self._apply_rotations(x_chunk, k_sub=None) # Full 24 rotations
         logits_all = self.network(x_all)
         logits_reshaped = logits_all.view(-1, 24, self.hparams.num_classes)
-        avg_probs = torch.softmax(logits_reshaped, dim=-1).mean(dim=1)
+        avg_probs = fixed_softmax(logits_reshaped, dim=-1).mean(dim=1)
         all_avg_probs.append(avg_probs)
       
       return torch.cat(all_avg_probs, dim=0)
@@ -171,33 +245,38 @@ class RubikDistancePredictor(LightningModule):
 
     if self.hparams.augment:
       k_sub = self.hparams.k_rotations
-      logits_aug = self.forward(x, return_aug=True, k_sub=k_sub)  # (B, K, C)
-      log_probs = F.log_softmax(logits_aug, dim=-1)               # (B, K, C)
+      logits_aug = self.forward(x, return_aug=True, k_sub=k_sub)          # (B, K, C)
+      log_probs = fixed_log_softmax(logits_aug, dim=-1)                   # (B, K, C)
 
       # 1. Supervision Loss
-      y_expanded = y_labels.unsqueeze(1).repeat(1, k_sub).view(-1).long()
-      sup_loss = F.cross_entropy(
+      y_expanded = y_labels.unsqueeze(1).expand(-1, k_sub).reshape(-1).long()
+      sup_loss = fixed_cross_entropy(
           logits_aug.view(-1, self.hparams.num_classes),
           y_expanded,
           weight=self.loss_weights,
       )
 
-      # 2. Compute Target Probabilities and Blended Target
+      # 2. Compute Target Log-Probabilities and Blended Target in log space
       with torch.no_grad():
-        sub_centroid = torch.softmax(logits_aug, dim=-1).mean(dim=1).detach() # (B, C)
-        y_onehot = F.one_hot(y_labels, num_classes=self.hparams.num_classes).float() # (B, C)
-        
-        # Blend sub-centroid ensemble with ground truth target
-        blended_target = (1.0 - gamma) * sub_centroid + gamma * y_onehot
-        blended_target = blended_target.clamp(min=1e-7)
+        b_max = log_probs.amax(dim=1, keepdim=True)
+        log_centroid = (
+            b_max + torch.log1p(torch.expm1(log_probs - b_max).mean(dim=1, keepdim=True))
+        ).squeeze(1)                                                      # (B, C)
+        is_t = F.one_hot(y_labels, num_classes=self.hparams.num_classes).bool()
+        log_blended = torch.where(
+            is_t,
+            torch.log1p((1.0 - gamma) * torch.expm1(log_centroid)),
+            log_centroid + math.log1p(-gamma),
+        )                                                                 # (B, C)
 
       # 3. Flatten tensors to (B * K, C) to ensure correct batchmean KL divergence scaling
+      logits_flat = logits_aug.view(-1, self.hparams.num_classes)
       log_probs_flat = log_probs.view(-1, self.hparams.num_classes)
-      centroid_flat = sub_centroid.unsqueeze(1).repeat(1, k_sub, 1).view(-1, self.hparams.num_classes)
-      blended_flat = blended_target.unsqueeze(1).repeat(1, k_sub, 1).view(-1, self.hparams.num_classes)
+      log_centroid_flat = log_centroid.unsqueeze(1).expand(-1, k_sub, -1).reshape(-1, self.hparams.num_classes)
+      log_blended_flat = log_blended.unsqueeze(1).expand(-1, k_sub, -1).reshape(-1, self.hparams.num_classes)
 
-      raw_consistency_loss = F.kl_div(log_probs_flat, centroid_flat, reduction='batchmean')
-      blended_consistency_loss = F.kl_div(log_probs_flat, blended_flat, reduction='batchmean')
+      raw_consistency_loss = fixed_kl_div(logits_flat, log_centroid_flat, log_q=log_probs_flat)
+      blended_consistency_loss = fixed_kl_div(logits_flat, log_blended_flat, log_q=log_probs_flat)
 
       # Record blended loss for EMA calculation
       self.consistency_schedule.record_losses(
@@ -225,8 +304,9 @@ class RubikDistancePredictor(LightningModule):
       self.log('loss/consistency_ratio_pct', loss_ratio, on_step=True, on_epoch=True, prog_bar=False)
       self.log('params/gamma', gamma, on_step=True, prog_bar=False)
     else:
-      logits = self.network(x)
-      loss = F.cross_entropy(logits, y_labels)
+      x_pairs = self._compute_upper_gram(x)
+      logits = self.network(x_pairs)
+      loss = fixed_cross_entropy(logits, y_labels)
 
     self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
     self.log('c_weight', c_weight, on_step=True, prog_bar=False)
@@ -242,15 +322,14 @@ class RubikDistancePredictor(LightningModule):
       y_long = torch.clamp(y.long(), 0, self.hparams.num_classes - 1)
       y_scalar = y.float()
     
-    probs = self.forward(x) 
+    probs = self.forward(x)
     
-    val_loss = F.nll_loss(torch.log(probs + 1e-9), y_long)
+    val_loss = F.nll_loss(torch.log(probs.clamp(min=torch.finfo(probs.dtype).tiny)), y_long)
     
     preds = torch.argmax(probs, dim=-1)
     acc = (preds == y_long).float().mean()
     
-    distances = torch.arange(self.hparams.num_classes, device=self.device).float()
-    expected_distances = (probs * distances).sum(dim=-1)
+    expected_distances = (probs * self.eval_distances).sum(dim=-1)
     ev_error = torch.abs(expected_distances - y_scalar).mean()
     
     self.log('val_loss', val_loss, on_epoch=True, prog_bar=True)
@@ -274,13 +353,13 @@ class RubikDistancePredictor(LightningModule):
     }
 
   def on_before_optimizer_step(self, optimizer):
-    total_norm = 0.0
-    for p in self.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    
-    total_norm = total_norm ** 0.5
+    grads = [p.grad.detach() for p in self.parameters() if p.grad is not None]
+    if grads:
+      total_norm = torch.linalg.vector_norm(
+          torch.stack([torch.linalg.vector_norm(g, 2.0) for g in grads]), 2.0
+      ).item()
+    else:
+      total_norm = 0.0
 
     was_clipped = 1.0 if total_norm > self.hparams.grad_clip else 0.0
     
@@ -294,21 +373,60 @@ class RubikDistancePredictor(LightningModule):
     self.log('grad/total_norm', total_norm, on_step=True)
 
 
+def load_eval_model(path: str, device: str = "cpu") -> torch.nn.Module:
+  """Loads either a full PyTorch Lightning .ckpt checkpoint or a lightweight .pt payload."""
+  if path.endswith(".ckpt"):
+    model = RubikDistancePredictor.load_from_checkpoint(
+        path, map_location=device, strict=False
+    )
+  else:
+    payload = torch.load(path, map_location=device)
+    if isinstance(payload, torch.nn.Module):
+      model = payload
+    elif isinstance(payload, dict) and "state_dict" in payload:
+      hidden_dim = payload.get("hidden_dim", 4096)
+      num_classes = payload.get("num_classes", 21)
+      model = RubikDistancePredictor(hidden_dim=hidden_dim, num_classes=num_classes)
+      model.network.load_state_dict(payload["state_dict"])
+    elif isinstance(payload, dict):
+      model = RubikDistancePredictor(hidden_dim=4096, num_classes=21)
+      model.network.load_state_dict(payload)
+    else:
+      raise ValueError(f"Unrecognized model payload format in {path}")
+
+  model.to(device)
+  model.eval()
+  return model
+
+
 class RubikEnsemble:
-  def __init__(self, model_paths, device="cpu"):
+  """Ensemble container supporting both full Lightning checkpoints and shrunk PyTorch models."""
+  def __init__(self, models_or_paths, device: str = "cpu"):
     self.device = device
     self.models = []
-    for path in model_paths:
-      m = RubikDistancePredictor.load_from_checkpoint(path, map_location=device, strict=False)
-      m.eval()
-      self.models.append(m)
     
-    num_classes = self.models[0].hparams.num_classes
-    self.distances = torch.arange(num_classes, device=device).float()
-    print(f"Ensemble loaded with {len(self.models)} models.")
+    for item in models_or_paths:
+      if isinstance(item, str):
+        self.models.append(load_eval_model(item, device=device))
+      else:
+        item.to(device)
+        item.eval()
+        self.models.append(item)
 
-  def __call__(self, x):
+    if hasattr(self.models[0], "hparams") and hasattr(self.models[0].hparams, "num_classes"):
+      num_classes = self.models[0].hparams.num_classes
+    elif hasattr(self.models[0], "eval_distances"):
+      num_classes = len(self.models[0].eval_distances)
+    else:
+      num_classes = self.models[0].network[-1].out_features
+
+    self.distances = torch.arange(num_classes, device=device).float()
+    print(f"Ensemble loaded with {len(self.models)} model(s) on {device}.")
+
+  def __call__(self, x: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
+      if x.device != torch.device(self.device):
+        x = x.to(self.device)
       preds = torch.stack([m(x) for m in self.models])
       avg_probs = torch.mean(preds, dim=0)
       expected_value = (avg_probs * self.distances).sum(dim=-1)
@@ -376,12 +494,16 @@ class AdaptiveSigmoidalConsistencySchedule:
     self.ema_kl = None
 
   def record_losses(self, sup_loss: float, raw_kl_loss: float):
+    if not (math.isfinite(sup_loss) and math.isfinite(raw_kl_loss)):
+      return
+    sup_val = max(float(sup_loss), 1e-8)
+    kl_val = max(float(raw_kl_loss), 1e-8)
     if self.ema_sup is None:
-      self.ema_sup = float(sup_loss)
-      self.ema_kl = float(raw_kl_loss)
+      self.ema_sup = sup_val
+      self.ema_kl = kl_val
     else:
-      self.ema_sup = self.alpha * float(sup_loss) + (1.0 - self.alpha) * self.ema_sup
-      self.ema_kl = self.alpha * float(raw_kl_loss) + (1.0 - self.alpha) * self.ema_kl
+      self.ema_sup = self.alpha * sup_val + (1.0 - self.alpha) * self.ema_sup
+      self.ema_kl = self.alpha * kl_val + (1.0 - self.alpha) * self.ema_kl
 
   def get_weight(self, current_epoch: float) -> float:
     if self.ema_sup is None or self.ema_kl is None or self.ema_kl <= 1e-8:
@@ -435,7 +557,7 @@ if __name__ == "__main__":
 
   for run in range(6):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{timestamp}_run_{run}"
+    run_name = f"TEST_{timestamp}_run_{run}"
     run_dir = os.path.join("checkpoints", run_name)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -445,7 +567,7 @@ if __name__ == "__main__":
       cycle_filter=2,
       num_select=16,
       max_shared_prefix=3,
-      shift_offsets=[0, 4, 8, 12, 16],
+      shift_offsets=list(range(20)),
       transform_indices=list(range(48)),
       off_path_penalty=0.1,
       branch_depth_k=2,
@@ -460,7 +582,7 @@ if __name__ == "__main__":
 
     datamodule = RubikDataModule(
         data_dir=run_dir,
-        input_type="bipolarhot",
+        input_type="onehot",
         target_type="onehot",
         batch_size=train_batch_size,
         num_workers=4,
@@ -491,10 +613,10 @@ if __name__ == "__main__":
         hidden_dim=4096,
         train_ds_size=len(datamodule.train_ds),
         batch_size=datamodule.batch_size,
-        start_lr=3e-5,
-        peak_lr=1.2e-3,
+        start_lr=1e-5,
+        peak_lr=3.6e-4,
         end_lr=1e-6,
-        warmup_epochs=10,
+        warmup_epochs=1,
         warmup_power=0.5,
         decay_power=1.25,
         consistency_delay_epochs=0,
@@ -503,9 +625,9 @@ if __name__ == "__main__":
         target_ratio_pct=0.08,
         ema_epoch_fraction=0.3,
         k_rotations=8,
-        gamma_start=0.35,
+        gamma_start=0.2,
         gamma_end=0.10,
-        gamma_delay_epochs=30,
+        gamma_delay_epochs=10,
         gamma_ramp_end_epoch=120,
         augment=True,
         num_classes=num_classes,
