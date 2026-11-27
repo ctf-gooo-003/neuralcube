@@ -373,21 +373,60 @@ class RubikDistancePredictor(LightningModule):
     self.log('grad/total_norm', total_norm, on_step=True)
 
 
+def load_eval_model(path: str, device: str = "cpu") -> torch.nn.Module:
+  """Loads either a full PyTorch Lightning .ckpt checkpoint or a lightweight .pt payload."""
+  if path.endswith(".ckpt"):
+    model = RubikDistancePredictor.load_from_checkpoint(
+        path, map_location=device, strict=False
+    )
+  else:
+    payload = torch.load(path, map_location=device)
+    if isinstance(payload, torch.nn.Module):
+      model = payload
+    elif isinstance(payload, dict) and "state_dict" in payload:
+      hidden_dim = payload.get("hidden_dim", 4096)
+      num_classes = payload.get("num_classes", 21)
+      model = RubikDistancePredictor(hidden_dim=hidden_dim, num_classes=num_classes)
+      model.network.load_state_dict(payload["state_dict"])
+    elif isinstance(payload, dict):
+      model = RubikDistancePredictor(hidden_dim=4096, num_classes=21)
+      model.network.load_state_dict(payload)
+    else:
+      raise ValueError(f"Unrecognized model payload format in {path}")
+
+  model.to(device)
+  model.eval()
+  return model
+
+
 class RubikEnsemble:
-  def __init__(self, model_paths, device="cpu"):
+  """Ensemble container supporting both full Lightning checkpoints and shrunk PyTorch models."""
+  def __init__(self, models_or_paths, device: str = "cpu"):
     self.device = device
     self.models = []
-    for path in model_paths:
-      m = RubikDistancePredictor.load_from_checkpoint(path, map_location=device, strict=False)
-      m.eval()
-      self.models.append(m)
     
-    num_classes = self.models[0].hparams.num_classes
-    self.distances = torch.arange(num_classes, device=device).float()
-    print(f"Ensemble loaded with {len(self.models)} models.")
+    for item in models_or_paths:
+      if isinstance(item, str):
+        self.models.append(load_eval_model(item, device=device))
+      else:
+        item.to(device)
+        item.eval()
+        self.models.append(item)
 
-  def __call__(self, x):
+    if hasattr(self.models[0], "hparams") and hasattr(self.models[0].hparams, "num_classes"):
+      num_classes = self.models[0].hparams.num_classes
+    elif hasattr(self.models[0], "eval_distances"):
+      num_classes = len(self.models[0].eval_distances)
+    else:
+      num_classes = self.models[0].network[-1].out_features
+
+    self.distances = torch.arange(num_classes, device=device).float()
+    print(f"Ensemble loaded with {len(self.models)} model(s) on {device}.")
+
+  def __call__(self, x: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
+      if x.device != torch.device(self.device):
+        x = x.to(self.device)
       preds = torch.stack([m(x) for m in self.models])
       avg_probs = torch.mean(preds, dim=0)
       expected_value = (avg_probs * self.distances).sum(dim=-1)
